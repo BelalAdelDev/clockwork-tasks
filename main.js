@@ -26,7 +26,7 @@ function createTasksChecker({ config }) {
         const block = [stripTag(lines[i], config.activeTag)];
         let j = i + 1;
         while (j < doneIndex && isChild(lines[j])) block.push(lines[j++]);
-        moved.push({ block, index: moved.length, done: task.done, due: task.due });
+        moved.push({ block, index: moved.length, done: task.done || task.cancelled, due: task.due });
         i = j;
       } else {
         kept.push(lines[i++]);
@@ -66,6 +66,62 @@ function createTasksChecker({ config }) {
 module.exports = { createTasksChecker };
 
 },
+"editor": function (module, exports, require) {
+// Editor hook for completion stamps. A CodeMirror transaction filter, i.e. the stamp is added INSIDE the very same
+// transaction as the checkbox change (this is why it is instantaneous, and why one Ctrl+Z undoes both).
+
+const { EditorState } = require("@codemirror/state");
+const { lineEdits } = require("./stamp");
+
+// BEFORE the edit the brackets may be mid-edit ("[]" after a Backspace, "[ -]" after typing next to the space),
+// AFTER it they must be a proper one-character status followed by a space / end of line.
+const OLD_RE = /^\s*[-*]\s+\[([^\]]*)\](?:\s|$)/;
+const NEW_RE = /^\s*[-*]\s+\[(.)\](?:\s|$)/;
+const MAX_LINES = 20;
+
+// Specs (in NEW-document coordinates) for every line whose checkbox status changed in this transaction.
+function stampChanges(tr, opts) {
+  const oldDoc = tr.startState.doc;
+  const newDoc = tr.newDoc;
+  const touched = new Set();
+  let simple = true;
+
+  tr.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+    if (!simple) return;
+    const line = oldDoc.lineAt(fromA);
+    if (inserted.lines > 1 || toA > line.to) simple = false; // paste / newline / multi-line delete: leave alone
+    else touched.add(line.number);
+  });
+  if (!simple || !touched.size || touched.size > MAX_LINES) return [];
+
+  const specs = [];
+  for (const n of touched) {
+    const oldLine = oldDoc.line(n);
+    const before = oldLine.text.match(OLD_RE);
+    if (!before) continue;
+    const newLine = newDoc.lineAt(tr.changes.mapPos(oldLine.from, -1));
+    const after = newLine.text.match(NEW_RE);
+    if (!after || after[1] === before[1]) continue; // text edit, not a status change
+    for (const e of lineEdits(newLine.text, opts.today, opts)) {
+      specs.push({ from: newLine.from + e.from, to: newLine.from + e.to, insert: e.text });
+    }
+  }
+  return specs;
+}
+
+function createStampExtension(plugin) {
+  return EditorState.transactionFilter.of((tr) => {
+    if (!tr.docChanged || tr.isUserEvent("undo") || tr.isUserEvent("redo")) return tr;
+    const opts = plugin.stampOptions();
+    if (opts.done === false && opts.cancel === false) return tr;
+    const specs = stampChanges(tr, opts);
+    return specs.length ? [tr, { changes: specs, sequential: true }] : tr;
+  });
+}
+
+module.exports = { createStampExtension, stampChanges };
+
+},
 "engine": function (module, exports, require) {
 // Config + wiring + orchestration. Contains no parsing / generating / date logic itself.
 //
@@ -85,7 +141,7 @@ const { createLogger, compactBlankLines, formatDate, moment } = require("./utils
 
 // ── config (override per run with options.config) ────────────────────────────
 const DEFAULTS = {
-  configBlock: "clockworks-tasks", // language of the ```clockworks-tasks code block that marks a TaskFile
+  configBlock: "clockwork-tasks", // language of the ```clockwork-tasks code block that marks a TaskFile
   defaultTrigger: "daily",
   defaultAnchor: "2026-03-27", // rotation start for [cyclic]; override per file with `anchor:` in the block
   triggers: { daily: { at: "00:00" } }, // per-trigger options
@@ -140,7 +196,7 @@ function createEngine({ io, store, config, clock, log, notify = () => {}, extens
   }
 
   async function run(options = {}) {
-    const report = { status: "idle", taskFiles: 0, fired: 0, created: 0, duplicates: 0, warnings: [], errors: [], notes: [] };
+    const report = { status: "idle", taskFiles: 0, fired: 0, created: 0, duplicates: 0, warnings: [], errors: [], notes: [], outputs: [] };
 
     // 1. identify + read
     const models = await loadTaskFiles(await discoverTaskFiles(io, config, options.paths), report);
@@ -174,6 +230,8 @@ function createEngine({ io, store, config, clock, log, notify = () => {}, extens
       );
       group.fired.push({ model, decision, generated });
     }
+
+    report.outputs = [...groups.keys()];
 
     // 4 + 5. write, sweep, commit
     for (const group of groups.values()) {
@@ -336,10 +394,15 @@ module.exports = { createTasksGenerator, insertTasks };
 
 },
 "main": function (module, exports, require) {
-// Clockwork Tasks — standalone Obsidian plugin entry. No Templater needed.
-const { Plugin, PluginSettingTab, Setting, Notice } = require("obsidian");
+// Clockwork Tasks — standalone Obsidian plugin entry. No Templater and no Tasks plugin needed.
+const { Plugin, PluginSettingTab, Setting, Notice, MarkdownView } = require("obsidian");
 const { createClockworkTasks, DEFAULTS } = require("./engine");
-const { createPluginStore } = require("./triggers");
+const { createPluginStore, nextPeriodStart } = require("./triggers");
+const { transitionEdits } = require("./stamp");
+const { createStampExtension } = require("./editor");
+const { createSuggestExtension, DatePopup } = require("./suggest");
+const { MARKER } = require("./parser");
+const { moment, formatDate } = require("./utils");
 
 const DEFAULT_SETTINGS = {
   configBlock: DEFAULTS.configBlock,
@@ -348,20 +411,31 @@ const DEFAULT_SETTINGS = {
   activeTag: DEFAULTS.activeTag,
   doneHeading: DEFAULTS.doneHeading,
   deactivateStale: DEFAULTS.deactivateStale,
-  checkIntervalMinutes: 5,
+  checkIntervalSeconds: 300, // safety-net poll; the exact rollover is scheduled separately (see scheduleRollover)
   runOnStartup: true,
+  doneDates: "auto", // ✅ / ❌ stamps. "auto" = only while the Tasks plugin is NOT enabled · "always" · "off"
+  cancelDates: "always", // ❌ stamps. The Tasks plugin does not stamp these, so by default they stay on even when it is enabled
+  dateSuggest: "auto", // 📅 menu. same three modes
+  dateMenu: true, // step 1 of the menu ("Due date") while typing; off = the menu only appears after you type 📅
   debug: false,
 };
 
-const RESTART_CHECKED = /\[[xX]\][^\n]*%%clockworks-tasks:restart%%/;
+const RESTART_CHECKED = /\[[xX]\][^\n]*%%clockwork-tasks:restart%%/;
+const SNAPSHOT_LIMIT = 40;
 
 module.exports = class ClockworkTasksPlugin extends Plugin {
   async onload() {
     const data = (await this.loadData()) || {};
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings);
+    const saved = Object.assign({}, data.settings);
+    if (saved.checkIntervalSeconds === undefined && saved.checkIntervalMinutes !== undefined) {
+      saved.checkIntervalSeconds = Math.max(1, Math.round(Number(saved.checkIntervalMinutes) * 60)) || 300; // old setting was in minutes
+    }
+    delete saved.checkIntervalMinutes;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
     this.state = data.state || {};
     this.running = false;
     this.queued = false;
+    this.snapshots = new Map(); // path -> last known content (to find checkbox changes made outside the editor)
     this.saveChain = Promise.resolve();
     this.store = createPluginStore({ get: () => this.state, save: () => this.persist() });
 
@@ -383,19 +457,31 @@ module.exports = class ClockworkTasksPlugin extends Plugin {
       },
     });
 
-    // event-based: react as soon as a restart checkbox is checked
-    this.registerEvent(
-      this.app.vault.on("modify", async (file) => {
-        if (file.extension !== "md") return;
-        if (RESTART_CHECKED.test(await this.app.vault.read(file))) this.requestRun({ manual: true });
-      })
-    );
+    this.addCommand({
+      id: "due-menu",
+      name: "Show due-date menu at cursor",
+      editorCallback: (editor) => {
+        if (!this.suggestActive()) return new Notice("Clockwork Tasks: the due-date menu is off (Tasks plugin enabled, or the setting is Off).");
+        const view = editor.cm;
+        const popup = view && this.menuPlugin ? view.plugin(this.menuPlugin) : null;
+        if (!popup) return new Notice("Clockwork Tasks: the editor hook is not attached to this editor. Run \"Diagnose editor features\".");
+        if (!popup.show()) new Notice("Put the cursor at the end of an open task line (- [ ] text) without a 📅, then try again.");
+      },
+    });
+    this.addCommand({ id: "diagnose", name: "Diagnose editor features", callback: () => this.diagnose() });
 
-    // tick-based: catches the midnight rollover
+    // Editor: instant ✅/❌ stamping (inside the checkbox transaction) + the 📅 menu. Works in every note.
+    this.registerEditorExtension([createStampExtension(this), createSuggestExtension(this)]);
+
+    // Outside the editor (reading-mode checkbox): compare with the last snapshot of the file.
+    this.registerEvent(this.app.workspace.on("file-open", (file) => file && file.extension === "md" && this.snapshot(file)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.onVaultModify(file)));
+
+    // regular check (safety net) + an exact wake-up at the next rollover
     this.startTimer();
+    this.scheduleRollover();
 
-    // on startup: wait until the vault index is ready
-    // (delayed so Obsidian finishes loading the workspace and indexing notes first)
+    // on startup (delayed so Obsidian finishes loading the workspace and indexing notes first)
     if (this.settings.runOnStartup) {
       this.app.workspace.onLayoutReady(() => {
         this.startupTimer = window.setTimeout(() => this.run(), 8000);
@@ -406,6 +492,7 @@ module.exports = class ClockworkTasksPlugin extends Plugin {
   onunload() {
     clearTimeout(this.debounce);
     window.clearTimeout(this.startupTimer);
+    window.clearTimeout(this.rolloverTimer);
   }
 
   // ── plumbing ───────────────────────────────────────────────────────────────
@@ -416,11 +503,119 @@ module.exports = class ClockworkTasksPlugin extends Plugin {
     return this.saveChain;
   }
 
+  // ── Tasks-plugin coexistence ───────────────────────────────────────────────
+  // "auto" = we only do a job while the Tasks plugin is NOT enabled, so the two never double up.
+  tasksPluginActive() {
+    const plugins = this.app.plugins;
+    return !!(plugins && plugins.enabledPlugins && plugins.enabledPlugins.has("obsidian-tasks-plugin"));
+  }
+
+  featureOn(mode) {
+    return mode === "always" || (mode === "auto" && !this.tasksPluginActive());
+  }
+
+  suggestActive() {
+    return this.featureOn(this.settings.dateSuggest);
+  }
+
+  diagnose() {
+    const s = this.settings;
+    const info = {
+      version: this.manifest && this.manifest.version,
+      tasksPluginEnabled: this.tasksPluginActive(),
+      doneDates: `${s.doneDates} -> ${this.featureOn(s.doneDates) ? "ACTIVE" : "inactive"}`,
+      cancelDates: `${s.cancelDates} -> ${this.featureOn(s.cancelDates) ? "ACTIVE" : "inactive"}`,
+      dateMenu: `${s.dateSuggest} -> ${this.suggestActive() ? "ACTIVE" : "inactive"}`,
+      menuWhileTyping: s.dateMenu !== false,
+      checkEvery: `${Math.floor(s.checkIntervalSeconds / 60)} min ${s.checkIntervalSeconds % 60} s`,
+      nextRollover: this.nextRollover ? this.nextRollover.format("YYYY-MM-DD HH:mm:ss") : "not scheduled",
+      editorsWithMenuHook: DatePopup.instances.size,
+    };
+    console.log("[Clockwork Tasks] diagnose", info);
+    new Notice(
+      "Clockwork Tasks " + info.version + "\n" + Object.entries(info).slice(1).map(([k, v]) => `${k}: ${v}`).join("\n"),
+      15000
+    );
+  }
+
+  stampOptions() {
+    return {
+      today: formatDate(moment()),
+      skipMarker: MARKER,
+      done: this.featureOn(this.settings.doneDates),
+      cancel: this.featureOn(this.settings.cancelDates),
+    };
+  }
+
+  // ── changes made outside the editor ────────────────────────────────────────
+  remember(path, content) {
+    this.snapshots.delete(path);
+    if (!content.includes("[")) return; // no checkboxes, nothing to compare later
+    this.snapshots.set(path, content);
+    if (this.snapshots.size > SNAPSHOT_LIMIT) this.snapshots.delete(this.snapshots.keys().next().value);
+  }
+
+  async snapshot(file) {
+    try {
+      this.remember(file.path, await this.app.vault.cachedRead(file));
+    } catch (e) {
+      /* file vanished */
+    }
+  }
+
+  async onVaultModify(file) {
+    if (file.extension !== "md") return;
+    try {
+      const content = await this.app.vault.read(file);
+      if (RESTART_CHECKED.test(content)) this.requestRun({ manual: true });
+      await this.stampExternal(file, content);
+    } catch (err) {
+      console.error("[Clockwork Tasks]", err);
+    }
+  }
+
+  async stampExternal(file, content) {
+    const prev = this.snapshots.get(file.path);
+    this.remember(file.path, content);
+    const opts = this.stampOptions();
+    if (prev === undefined || prev === content || (!opts.done && !opts.cancel)) return;
+
+    // the editor hook already handled anything typed/clicked in an editing view of this note
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (view && view.file && view.file.path === file.path && view.getMode() === "source") return;
+
+    if (!transitionEdits(prev, content, opts).edits.length) return;
+    let result = content;
+    await this.app.vault.process(file, (c) => (result = transitionEdits(prev, c, opts).content));
+    this.remember(file.path, result);
+  }
+
   startTimer() {
     if (this.timer) window.clearInterval(this.timer);
-    const ms = Math.max(1, Number(this.settings.checkIntervalMinutes) || 5) * 60 * 1000;
-    this.timer = window.setInterval(() => this.run(), ms);
+    const ms = Math.max(1, Number(this.settings.checkIntervalSeconds) || 300) * 1000;
+    this.timer = window.setInterval(() => this.tick(), ms);
     this.registerInterval(this.timer);
+  }
+
+  // every regular check also re-syncs the exact timer (covers sleep, and system-clock changes)
+  tick() {
+    this.run();
+    this.scheduleRollover();
+  }
+
+  // Works out how long until the next rollover (e.g. midnight) and wakes up exactly then, so new tasks
+  // appear on time instead of at the next regular check.
+  scheduleRollover() {
+    window.clearTimeout(this.rolloverTimer);
+    const next = nextPeriodStart(moment(), this.buildConfig());
+    if (!next) return;
+    const delay = Math.min(Math.max(0, next.diff(moment())) + 100, 2147483647); // +100 ms: land just after the boundary
+    this.nextRollover = next;
+    if (this.settings.debug) console.log(`[Clockwork Tasks] next rollover ${next.format("YYYY-MM-DD HH:mm:ss")} (in ${Math.round(delay / 1000)} s)`);
+    this.rolloverTimer = window.setTimeout(() => {
+      this.run();
+      this.scheduleRollover();
+    }, delay);
   }
 
   requestRun(options = {}) {
@@ -505,53 +700,63 @@ class ClockworkTasksSettingTab extends PluginSettingTab {
             if (after) after();
           })
         );
+    const toggle = (name, desc, key) =>
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addToggle((t) =>
+          t.setValue(p.settings[key]).onChange(async (v) => {
+            p.settings[key] = v;
+            await p.persist();
+          })
+        );
+    const modes = { auto: "Auto (off while the Tasks plugin is enabled)", always: "Always on", off: "Off" };
+    const mode = (name, desc, key) =>
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addDropdown((d) =>
+          d.addOptions(modes).setValue(p.settings[key]).onChange(async (v) => {
+            p.settings[key] = v;
+            await p.persist();
+          })
+        );
 
-    text("Config block language", "Code-block language that marks a TaskFile (```clockworks-tasks).", "configBlock");
-    text("Rollover time", "HH:MM. \"04:00\" keeps 00:00–03:59 as the previous day.", "rolloverTime");
+    text("Config block language", "Code-block language that marks a TaskFile (```clockwork-tasks).", "configBlock");
+    text("Rollover time", "HH:MM. \"04:00\" keeps 00:00–03:59 as the previous day.", "rolloverTime", () => p.scheduleRollover());
     text("Default anchor date", "YYYY-MM-DD start for [cyclic] rotation. Override per file with `anchor:`.", "defaultAnchor");
     text("Active tag", "Tag added to today's generated tasks.", "activeTag");
     text("Done heading", "Heading under which completed tasks are moved.", "doneHeading");
+    toggle("Deactivate stale tasks", "Strip the active tag from unfinished Clockwork Tasks tasks due before today.", "deactivateStale");
 
-    new Setting(containerEl)
-      .setName("Deactivate stale tasks")
-      .setDesc("Strip the active tag from unfinished Clockwork Tasks tasks due before today.")
-      .addToggle((t) =>
-        t.setValue(p.settings.deactivateStale).onChange(async (v) => {
-          p.settings.deactivateStale = v;
-          await p.persist();
-        })
-      );
+    mode("Done dates (✅)", "Stamp the date when a task in ANY note is ticked ([x]); remove it when unticked. Auto steps aside for the Tasks plugin, which does this itself.", "doneDates");
+    mode("Cancelled dates (❌)", "Stamp the date when a task is cancelled ([-]). The Tasks plugin doesn't do this, so the default is Always on.", "cancelDates");
+    mode("Due-date menu (📅)", "A menu while you type on a task line: Enter on \"Due date\" inserts 📅 and offers dates.", "dateSuggest");
+    toggle("Show the menu while typing", "Off = the menu appears only after you type 📅 yourself.", "dateMenu");
 
+    let minField, secField;
+    const applyInterval = async () => {
+      const total = (Number(minField.getValue()) || 0) * 60 + (Number(secField.getValue()) || 0);
+      if (!(total >= 1)) return; // ignore 0 / half-typed values
+      p.settings.checkIntervalSeconds = Math.floor(total);
+      await p.persist();
+      p.startTimer();
+    };
+    const field = (t, placeholder, value) => {
+      t.setPlaceholder(placeholder).setValue(String(value)).onChange(applyInterval);
+      t.inputEl.inputMode = "numeric";
+      t.inputEl.size = 5;
+      t.inputEl.setAttribute("aria-label", placeholder);
+      return t;
+    };
+    const total = Number(p.settings.checkIntervalSeconds) || 300;
     new Setting(containerEl)
-      .setName("Check interval (minutes)")
-      .setDesc("How often to check for a new day.")
-      .addText((t) =>
-        t.setValue(String(p.settings.checkIntervalMinutes)).onChange(async (v) => {
-          const n = Number(v);
-          if (!Number.isFinite(n) || n < 1) return;
-          p.settings.checkIntervalMinutes = n;
-          await p.persist();
-          p.startTimer();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Run on startup")
-      .addToggle((t) =>
-        t.setValue(p.settings.runOnStartup).onChange(async (v) => {
-          p.settings.runOnStartup = v;
-          await p.persist();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName("Debug logging")
-      .addToggle((t) =>
-        t.setValue(p.settings.debug).onChange(async (v) => {
-          p.settings.debug = v;
-          await p.persist();
-        })
-      );
+      .setName("Check interval")
+      .setDesc("Left box: minutes, right box: seconds (e.g. 5 min 21 s). A safety-net check; new days are also caught exactly at the rollover time. Each check rescans the vault, so very short intervals cost performance.")
+      .addText((t) => (minField = field(t, "minutes", Math.floor(total / 60))))
+      .addText((t) => (secField = field(t, "seconds", total % 60)));
+    toggle("Run on startup", "", "runOnStartup");
+    toggle("Debug logging", "", "debug");
   }
 }
 
@@ -577,9 +782,9 @@ function discoverTaskFiles(io, config, explicitPaths) {
 
 // ── restart checkbox ─────────────────────────────────────────────────────────
 // Checking it forces generation on the next run. %%...%% is an Obsidian comment (invisible when rendered).
-const MARKER = "%%clockworks-tasks:restart%%";
+const MARKER = "%%clockwork-tasks:restart%%";
 const CONTROL_LINE = `- [ ] \u{1F501} Restart Clockwork Tasks (regenerate today's tasks) ${MARKER}`;
-const RESTART_RE = /^([ \t]*[-*][ \t]+\[)([ xX])(\][^\n]*%%clockworks-tasks:restart%%[^\n]*)$/m;
+const RESTART_RE = /^([ \t]*[-*][ \t]+\[)([ xX])(\][^\n]*%%clockwork-tasks:restart%%[^\n]*)$/m;
 
 const restartControl = {
   read(content) {
@@ -592,9 +797,10 @@ const restartControl = {
     const nl = content.includes("\r\n") ? "\r\n" : "\n";
     return content.slice(0, end) + (end ? nl : "") + CONTROL_LINE + nl + nl + content.slice(end);
   },
+  // uncheck the box AND drop the ✅ date that was stamped when it was ticked
   reset: (content) =>
-  content.replace(RESTART_RE, (line, pre, _box, rest) =>
-    `${pre} ${rest.replace(/\s*\u2705\s*\d{4}-\d{2}-\d{2}/g, "")}`),
+    content.replace(RESTART_RE, (line, pre, _box, rest) =>
+      `${pre} ${rest.replace(/\s*\u2705\s*\d{4}-\d{2}-\d{2}/g, "")}`),
 };
 
 // ── parser ───────────────────────────────────────────────────────────────────
@@ -722,7 +928,7 @@ function createTaskFileParser({ config, schedules, modifiers }) {
   return { parse };
 }
 
-module.exports = { createTaskFileParser, discoverTaskFiles, restartControl };
+module.exports = { createTaskFileParser, discoverTaskFiles, restartControl, MARKER };
 
 },
 "rules": function (module, exports, require) {
@@ -823,6 +1029,379 @@ const createModifierRegistry = (extra = []) => createRegistry("modifier", [...mo
 module.exports = { createScheduleRegistry, createModifierRegistry };
 
 },
+"stamp": function (module, exports, require) {
+// Completion-date stamping, Tasks-plugin compatible:  done "✅ YYYY-MM-DD"  ·  cancelled "❌ YYYY-MM-DD".
+// Pure string logic (no Obsidian / CodeMirror). A task line always ends up with exactly the stamp its CURRENT status needs:
+//   [x]/[X]  -> one ✅, no ❌        [-] -> one ❌, no ✅        anything else ( [ ] [/] ... ) -> neither
+// so done -> cancelled (and back) swaps the stamp directly; nobody has to untick first.
+
+const TASK_LINE = /^(\s*)([-*])\s+\[(.)\]\s?(.*)$/;
+const DONE_DATE = /\s*\u2705\s*\d{4}-\d{2}-\d{2}/g;
+const CANCEL_DATE = /\s*\u274C\s*\d{4}-\d{2}-\d{2}/g;
+const DONE_STATUSES = ["x", "X"];
+const CANCEL_STATUSES = ["-"];
+
+const ranges = (text, re) => [...text.matchAll(re)].map((d) => ({ from: d.index, to: d.index + d[0].length }));
+const noCR = (s) => (s.endsWith("\r") ? s.slice(0, -1) : s);
+
+// status char of a task line, or null when it is not a task
+function statusOf(text) {
+  const m = noCR(text).match(TASK_LINE);
+  return m ? m[3] : null;
+}
+
+// Edits (ch offsets inside the line) that make this line's stamps match its status.
+// `done` / `cancel` say which stamps WE manage (the Tasks plugin may own ✅ while we still own ❌). edit = { from, to, text }
+function lineEdits(text, today, { skipMarker = "", done: manageDone = true, cancel: manageCancel = true } = {}) {
+  const m = text.match(TASK_LINE);
+  if (!m || (skipMarker && text.includes(skipMarker))) return [];
+  const status = m[3];
+  const isDone = DONE_STATUSES.includes(status);
+  const isCancel = CANCEL_STATUSES.includes(status);
+  const done = ranges(text, DONE_DATE);
+  const cancel = ranges(text, CANCEL_DATE);
+  const edits = [];
+  const drop = (rs) => rs.forEach((r) => edits.push({ from: r.from, to: r.to, text: "" }));
+  const append = (emoji) => edits.push({ from: text.length, to: text.length, text: ` ${emoji} ${today}` });
+
+  // ✅  ours when we manage done dates; also when a task we manage as cancelled must lose its done date
+  if (manageDone || (manageCancel && isCancel)) {
+    if (!isDone) drop(done);
+    else if (done.length) drop(done.slice(1));
+    else append("\u2705");
+  }
+  // ❌  ours when we manage cancelled dates; also when a task we manage as done must lose its cancelled date
+  if (manageCancel || (manageDone && isDone)) {
+    if (!isCancel) drop(cancel);
+    else if (cancel.length) drop(cancel.slice(1));
+    else append("\u274C");
+  }
+  return edits;
+}
+
+// Right-to-left, bottom-to-top, so earlier offsets stay valid while applying one by one.
+const orderForApply = (edits) => [...edits].sort((a, b) => b.line - a.line || b.from - a.from);
+
+function applyEdits(content, edits) {
+  const lines = content.split("\n");
+  for (const e of orderForApply(edits)) {
+    const l = lines[e.line];
+    lines[e.line] = l.slice(0, e.from) + e.text + l.slice(e.to);
+  }
+  return lines.join("\n");
+}
+
+// For changes that happen outside the editor (reading-mode checkbox): compare the previous and the new file content
+// and stamp only the lines whose STATUS changed (so old, untouched tasks are never stamped).
+function transitionEdits(prevContent, nextContent, { today, skipMarker = "", done, cancel } = {}) {
+  const a = prevContent.split("\n");
+  const b = nextContent.split("\n");
+  if (a.length !== b.length) return { edits: [], content: nextContent };
+
+  const edits = [];
+  for (let i = 0; i < b.length; i++) {
+    if (a[i] === b[i]) continue;
+    const before = statusOf(a[i]);
+    const after = statusOf(b[i]);
+    if (before === null || after === null || before === after) continue;
+    for (const e of lineEdits(noCR(b[i]), today, { skipMarker, done, cancel })) edits.push({ line: i, ...e });
+  }
+  return { edits, content: edits.length ? applyEdits(nextContent, edits) : nextContent };
+}
+
+module.exports = { lineEdits, transitionEdits, applyEdits, orderForApply, statusOf };
+
+},
+"suggest": function (module, exports, require) {
+// Due-date menu. Two steps, driven by a small CodeMirror popup (so Enter / Esc / arrows are fully under our control):
+//   1. while you type on an open task line:   [📅 Due date] [⏎ New line]
+//      Enter on "Due date" inserts the 📅 for you and the menu turns into step 2.  Esc hides it until you type again.
+//   2. after a 📅:                            Today (…) · Tomorrow (…) · Monday (…) … · Next week (…)   (type to filter)
+
+const { ViewPlugin, keymap } = require("@codemirror/view");
+const { Prec } = require("@codemirror/state");
+const { moment, dayName, formatDate } = require("./utils");
+
+const DUE = "\u{1F4C5}"; // 📅 (2 UTF-16 units)
+const TASK_RE = /^(\s*[-*]\s+\[(.)\]\s?)(.*)$/;
+const AFTER_DUE_RE = /\u{1F4C5}([ \p{L}\p{N}-]*)$/u; // 📅 plus optional filter text, up to the cursor
+const ISO_RE = /^\d{4}-\d{2}-\d{2}$/;
+const REL_RE = /^(?:in\s+)?(\d{1,3})\s*(d|day|days|w|wk|wks|week|weeks|m|mo|month|months)?$/;
+const UNITS = { d: "days", w: "weeks", m: "months" };
+const cap = (s) => s[0].toUpperCase() + s.slice(1);
+
+// ── pure: which menu (if any) belongs at this cursor position ────────────────
+// -> null | { level: 1 } | { level: 2, query, from, to }   (from/to = replaceable range, ch offsets in the line)
+function computeContext(line, ch, { menu = true } = {}) {
+  const t = line.match(TASK_RE);
+  if (!t || ["x", "X", "-"].includes(t[2])) return null; // not a task, or already done / cancelled
+
+  const after = line.slice(0, ch).match(AFTER_DUE_RE);
+  if (after) {
+    const query = after[1].trim();
+    if (query.length > 24 || ISO_RE.test(query)) return null; // a complete date needs no menu
+    return { level: 2, query, from: after.index + DUE.length, to: ch };
+  }
+
+  const atEnd = line.slice(ch).trim() === "";
+  if (menu && atEnd && t[3].trim() !== "" && !line.includes(DUE)) return { level: 1 };
+  return null;
+}
+
+// ── pure: date options -> [{ label, text: "YYYY-MM-DD" }] ────────────────────
+function suggestDates(query, now = moment()) {
+  const q = String(query || "").trim().toLowerCase();
+  const today = now.clone().startOf("day");
+  const out = [];
+  const add = (label, date) => {
+    const text = formatDate(date);
+    if (!out.some((o) => o.text === text)) out.push({ label, text });
+  };
+  const weekday = (offset) => {
+    const d = today.clone().add(offset, "days");
+    return [cap(dayName(d.day())), d];
+  };
+
+  if (!q) {
+    add("Today", today);
+    add("Tomorrow", today.clone().add(1, "day"));
+    for (let i = 2; i <= 6; i++) add(...weekday(i));
+    add("Next week", today.clone().add(7, "days"));
+    return out;
+  }
+
+  const named = [
+    ["Today", today],
+    ["Tomorrow", today.clone().add(1, "day")],
+    ["Next week", today.clone().add(7, "days")],
+    ["Next month", today.clone().add(1, "month")],
+    ["Yesterday", today.clone().subtract(1, "day")],
+  ];
+  for (const [label, date] of named) if (label.toLowerCase().startsWith(q)) add(label, date);
+
+  const wd = q.replace(/^next\s+/, "");
+  for (let i = 0; i < 7; i++) {
+    if (dayName(i).startsWith(wd)) add(cap(dayName(i)), today.clone().add(((i - today.day() + 6) % 7) + 1, "days"));
+  }
+
+  const rel = q.match(REL_RE);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unit = UNITS[(rel[2] || "d")[0]];
+    add(`In ${n} ${n === 1 ? unit.slice(0, -1) : unit}`, today.clone().add(n, unit));
+  }
+  if (ISO_RE.test(q)) {
+    const d = moment(q, "YYYY-MM-DD", true);
+    if (d.isValid()) add("Date", d);
+  }
+  return out.slice(0, 8);
+}
+
+const STEP1 = [
+  { type: "due", label: `${DUE} Due date` },
+  { type: "newline", label: "\u23CE New line" },
+];
+
+// ── popup controller (one per editor view) ───────────────────────────────────
+class DatePopup {
+  constructor(view, plugin) {
+    DatePopup.instances.add(this); // lets the "Diagnose" command prove the editor hook is attached
+    this.view = view;
+    this.plugin = plugin;
+    this.el = null;
+    this.ctx = null;
+    this.items = [];
+    this.index = 0;
+    this.dismissed = false;
+    this.onBlur = () => this.hide();
+    this.onScroll = () => this.position();
+    view.contentDOM.addEventListener("blur", this.onBlur);
+    if (view.scrollDOM) view.scrollDOM.addEventListener("scroll", this.onScroll);
+  }
+
+  update(u) {
+    try {
+      if (!this.plugin.suggestActive()) return this.hide();
+      const typed = u.docChanged && u.transactions.some((tr) => tr.isUserEvent("input") || tr.isUserEvent("delete"));
+      if (typed) this.dismissed = false; // typing wakes the menu up again after Esc
+      // only typing opens it; any other change/cursor move can only update or close an already-open menu
+      if (!typed && !((u.docChanged || u.selectionSet) && this.ctx)) return;
+      if (this.dismissed) return;
+      this.refresh();
+    } catch (err) {
+      console.error("[Clockwork Tasks] date menu", err);
+    }
+  }
+
+  // for the "Show due-date menu at cursor" command: open it without needing a keystroke
+  show() {
+    this.dismissed = false;
+    this.refresh();
+    return !!this.ctx;
+  }
+
+  refresh() {
+    const { state } = this.view;
+    const sel = state.selection.main;
+    if (!sel.empty) return this.hide();
+    const line = state.doc.lineAt(sel.head);
+    const ctx = computeContext(line.text, sel.head - line.from, { menu: this.plugin.settings.dateMenu !== false });
+    const items = !ctx ? [] : ctx.level === 1 ? STEP1 : suggestDates(ctx.query).map((o) => ({ ...o, label: `${o.label} (${o.text})` }));
+    if (this.plugin.settings.debug) console.log("[Clockwork Tasks] menu:", { line: line.text, ctx, items: items.length });
+    if (!ctx || !items.length) return this.hide();
+    this.ctx = { ...ctx, lineFrom: line.from };
+    this.items = items;
+    this.index = 0;
+    this.render();
+    this.position();
+  }
+
+  render() {
+    if (!this.el) {
+      const doc = this.view.dom.ownerDocument || document; // also works in pop-out windows
+      this.el = doc.createElement("div");
+      this.el.className = "suggestion-container clockwork-suggest";
+      // inline styles so it is visible whatever the theme / CSS snippets do to .suggestion-container
+      Object.assign(this.el.style, {
+        position: "fixed", zIndex: "10000", minWidth: "220px", maxHeight: "60vh", overflowY: "auto", display: "block",
+        visibility: "hidden", background: "var(--background-primary)", border: "1px solid var(--background-modifier-border)",
+        borderRadius: "var(--radius-m, 8px)", boxShadow: "var(--shadow-s, 0 2px 8px rgba(0,0,0,.3))", padding: "4px", left: "8px", top: "8px",
+      });
+      doc.body.appendChild(this.el);
+    }
+    this.el.textContent = "";
+    const box = document.createElement("div");
+    box.className = "suggestion";
+    this.items.forEach((item, i) => {
+      const row = document.createElement("div");
+      row.className = "suggestion-item mod-complex" + (i === this.index ? " is-selected" : "");
+      row.textContent = item.label;
+      Object.assign(row.style, { padding: "4px 10px", borderRadius: "var(--radius-s, 4px)", cursor: "pointer", color: "var(--text-normal)",
+        background: i === this.index ? "var(--background-modifier-hover)" : "transparent" });
+      row.addEventListener("mousedown", (e) => {
+        e.preventDefault(); // keep the editor focused
+        this.index = i;
+        this.choose();
+      });
+      box.appendChild(row);
+    });
+    this.el.appendChild(box);
+  }
+
+  // CodeMirror forbids reading layout during an update, so ask it to measure afterwards (requestMeasure).
+  position() {
+    if (!this.el || !this.ctx) return;
+    const head = this.view.state.selection.main.head;
+    this.view.requestMeasure({
+      key: this,
+      read: (view) => {
+        try {
+          return view.coordsAtPos(head);
+        } catch (e) {
+          return null;
+        }
+      },
+      write: (c) => {
+        if (!this.el) return;
+        if (c) {
+          const win = this.el.ownerDocument.defaultView || window;
+          const h = this.el.offsetHeight || 0;
+          const below = c.bottom + 4;
+          this.el.style.left = `${Math.max(4, c.left)}px`;
+          this.el.style.top = `${below + h > win.innerHeight ? Math.max(4, c.top - h - 4) : below}px`;
+        }
+        this.el.style.visibility = "visible"; // hidden until placed, so it never flashes in a corner
+      },
+    });
+  }
+
+  hide() {
+    this.ctx = null;
+    this.items = [];
+    if (this.el) {
+      this.el.remove();
+      this.el = null;
+    }
+  }
+
+  // returns true when the key was consumed
+  handleKey(key) {
+    if (!this.ctx) return false;
+    if (key === "Escape") {
+      this.dismissed = true;
+      this.hide();
+      return true;
+    }
+    if (key === "ArrowDown" || key === "ArrowUp") {
+      const n = this.items.length;
+      this.index = (this.index + (key === "ArrowDown" ? 1 : n - 1)) % n;
+      this.render();
+      return true;
+    }
+    return key === "Enter" ? this.choose() : false;
+  }
+
+  choose() {
+    const item = this.items[this.index];
+    const ctx = this.ctx;
+    if (!item || !ctx) return false;
+
+    if (ctx.level === 1) {
+      if (item.type === "newline") {
+        this.dismissed = true;
+        this.hide();
+        return false; // let Enter do its normal job (new list item)
+      }
+      const head = this.view.state.selection.main.head;
+      const prev = head > 0 ? this.view.state.doc.sliceString(head - 1, head) : "";
+      const insert = `${prev && !/\s/.test(prev) ? " " : ""}${DUE} `;
+      // "input.*" => counts as typing, so update() immediately swaps the menu for the date list
+      this.view.dispatch({ changes: { from: head, insert }, selection: { anchor: head + insert.length }, userEvent: "input.clockwork" });
+      return true;
+    }
+
+    const from = ctx.lineFrom + ctx.from;
+    const to = ctx.lineFrom + ctx.to;
+    const insert = ` ${item.text}`;
+    this.hide();
+    this.view.dispatch({ changes: { from, to, insert }, selection: { anchor: from + insert.length }, userEvent: "input.clockwork" });
+    return true;
+  }
+
+  destroy() {
+    DatePopup.instances.delete(this);
+    this.hide();
+    this.view.contentDOM.removeEventListener("blur", this.onBlur);
+    if (this.view.scrollDOM) this.view.scrollDOM.removeEventListener("scroll", this.onScroll);
+  }
+}
+
+DatePopup.instances = new Set();
+
+function createSuggestExtension(plugin) {
+  const popup = ViewPlugin.fromClass(
+    class extends DatePopup {
+      constructor(view) {
+        super(view, plugin);
+      }
+    }
+  );
+  plugin.menuPlugin = popup; // so commands can find the popup of an editor
+  const run = (key) => (view) => {
+    const p = view.plugin(popup);
+    return !!p && p.handleKey(key);
+  };
+  return [
+    popup,
+    Prec.highest(
+      keymap.of(["ArrowDown", "ArrowUp", "Enter", "Escape"].map((key) => ({ key, run: run(key) })))
+    ),
+  ];
+}
+
+module.exports = { computeContext, suggestDates, DatePopup, createSuggestExtension };
+
+},
 "triggers": function (module, exports, require) {
 // Trigger component: trigger definitions, the handler that reads/writes trigger state, and the state store.
 
@@ -842,8 +1421,26 @@ const triggers = [
       const logical = now.clone().subtract(h, "hours").subtract(m, "minutes").startOf("day");
       return { periodKey: logical.format("YYYY-MM-DD"), date: logical };
     },
+    // Real-clock moment at which the NEXT period begins (e.g. the coming midnight, or 04:00 with at = "04:00").
+    nextChange(now, { at = "00:00" } = {}) {
+      const [h = 0, m = 0] = String(at).split(":").map(Number);
+      const logical = now.clone().subtract(h, "hours").subtract(m, "minutes").startOf("day");
+      return logical.add(1, "day").hour(h).minute(m).second(0).millisecond(0);
+    },
   },
 ];
+
+// Earliest moment any trigger starts a new period, so the plugin can wake up exactly then instead of waiting for a poll.
+// Returns null when no trigger can name a next period. (A non-numeric rollover time behaves like 00:00, as in resolve().)
+function nextPeriodStart(now, config) {
+  let next = null;
+  for (const def of triggers) {
+    if (!def.nextChange) continue;
+    const at = def.nextChange(now, (config.triggers && config.triggers[def.name]) || {});
+    if (at && at.isValid() && (!next || at.isBefore(next))) next = at;
+  }
+  return next;
+}
 
 const createTriggerRegistry = (extra = []) => createRegistry("trigger", [...triggers, ...extra]);
 
@@ -936,7 +1533,7 @@ function createPluginStore(host) {
   };
 }
 
-module.exports = { createTriggerRegistry, createTriggerHandler, createLocalStorageStore, createMemoryStore, createPluginStore };
+module.exports = { createTriggerRegistry, createTriggerHandler, createLocalStorageStore, createMemoryStore, createPluginStore, nextPeriodStart };
 
 },
 "utils": function (module, exports, require) {
@@ -1000,7 +1597,7 @@ function parseDayList(text) {
   return { days, invalid };
 }
 
-// ── config block: a ```clockworks-tasks fenced code block of flat `key: value` lines ──
+// ── config block: a ```clockwork-tasks fenced code block of flat `key: value` lines ──
 // `end` = offset just after the closing fence; `body` = content with the block removed.
 const coerce = (raw) => {
   const v = raw.trim();
@@ -1045,9 +1642,11 @@ function createRegistry(label, defs = []) {
 // ── task lines (Tasks-plugin emoji format; change here to support other formats) ──
 const DUE = "\u{1F4C5}"; // 📅
 const DONE = "\u2705"; //  ✅
+const CANCEL = "\u274C"; // ❌
 const dateAfter = (marker) => new RegExp(`${marker}\\s*(\\d{4}-\\d{2}-\\d{2})`, "gu");
 const DUE_RE = dateAfter(DUE);
 const DONE_RE = dateAfter(DONE);
+const CANCEL_RE = dateAfter(CANCEL);
 const TASK_RE = /^(\s*)([-*])\s+\[(.)\]\s?(.*)$/;
 
 const lastDate = (text, re) => {
@@ -1059,7 +1658,7 @@ const lastDate = (text, re) => {
 function parseTask(line) {
   const m = line.match(TASK_RE);
   if (!m) return null;
-  return { indent: m[1], status: m[3], body: m[4], due: lastDate(m[4], DUE_RE), done: lastDate(m[4], DONE_RE) };
+  return { indent: m[1], status: m[3], body: m[4], due: lastDate(m[4], DUE_RE), done: lastDate(m[4], DONE_RE), cancelled: lastDate(m[4], CANCEL_RE) };
 }
 
 const formatTask = ({ text, due = "", tags = [], status = " " }) =>
@@ -1072,6 +1671,7 @@ function taskSignature(line, ignoreTags = []) {
   const tokens = task.body
     .replace(DUE_RE, " ")
     .replace(DONE_RE, " ")
+    .replace(CANCEL_RE, " ")
     .split(/\s+/)
     .filter((t) => t && !ignoreTags.includes(t));
   return `${task.due}|${tokens.join(" ")}`;

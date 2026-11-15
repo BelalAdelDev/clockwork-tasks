@@ -22,7 +22,7 @@ function createTasksChecker({ config }) {
         const block = [stripTag(lines[i], config.activeTag)];
         let j = i + 1;
         while (j < doneIndex && isChild(lines[j])) block.push(lines[j++]);
-        moved.push({ block, index: moved.length, done: task.done, due: task.due });
+        moved.push({ block, index: moved.length, done: task.done || task.cancelled, due: task.due });
         i = j;
       } else {
         kept.push(lines[i++]);

@@ -1,0 +1,6 @@
+# your personal plugin settings + per-day trigger state (never commit)
+data.json
+
+# working files
+*.patch
+node_modules/

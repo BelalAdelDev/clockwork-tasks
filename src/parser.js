@@ -18,9 +18,9 @@ function discoverTaskFiles(io, config, explicitPaths) {
 
 // ── restart checkbox ─────────────────────────────────────────────────────────
 // Checking it forces generation on the next run. %%...%% is an Obsidian comment (invisible when rendered).
-const MARKER = "%%clockworks-tasks:restart%%";
+const MARKER = "%%clockwork-tasks:restart%%";
 const CONTROL_LINE = `- [ ] \u{1F501} Restart Clockwork Tasks (regenerate today's tasks) ${MARKER}`;
-const RESTART_RE = /^([ \t]*[-*][ \t]+\[)([ xX])(\][^\n]*%%clockworks-tasks:restart%%[^\n]*)$/m;
+const RESTART_RE = /^([ \t]*[-*][ \t]+\[)([ xX])(\][^\n]*%%clockwork-tasks:restart%%[^\n]*)$/m;
 
 const restartControl = {
   read(content) {
@@ -33,7 +33,10 @@ const restartControl = {
     const nl = content.includes("\r\n") ? "\r\n" : "\n";
     return content.slice(0, end) + (end ? nl : "") + CONTROL_LINE + nl + nl + content.slice(end);
   },
-  reset: (content) => content.replace(RESTART_RE, "$1 $3"),
+  // uncheck the box AND drop the ✅ date that was stamped when it was ticked
+  reset: (content) =>
+    content.replace(RESTART_RE, (line, pre, _box, rest) =>
+      `${pre} ${rest.replace(/\s*\u2705\s*\d{4}-\d{2}-\d{2}/g, "")}`),
 };
 
 // ── parser ───────────────────────────────────────────────────────────────────
@@ -161,4 +164,4 @@ function createTaskFileParser({ config, schedules, modifiers }) {
   return { parse };
 }
 
-module.exports = { createTaskFileParser, discoverTaskFiles, restartControl };
+module.exports = { createTaskFileParser, discoverTaskFiles, restartControl, MARKER };

@@ -16,8 +16,26 @@ const triggers = [
       const logical = now.clone().subtract(h, "hours").subtract(m, "minutes").startOf("day");
       return { periodKey: logical.format("YYYY-MM-DD"), date: logical };
     },
+    // Real-clock moment at which the NEXT period begins (e.g. the coming midnight, or 04:00 with at = "04:00").
+    nextChange(now, { at = "00:00" } = {}) {
+      const [h = 0, m = 0] = String(at).split(":").map(Number);
+      const logical = now.clone().subtract(h, "hours").subtract(m, "minutes").startOf("day");
+      return logical.add(1, "day").hour(h).minute(m).second(0).millisecond(0);
+    },
   },
 ];
+
+// Earliest moment any trigger starts a new period, so the plugin can wake up exactly then instead of waiting for a poll.
+// Returns null when no trigger can name a next period. (A non-numeric rollover time behaves like 00:00, as in resolve().)
+function nextPeriodStart(now, config) {
+  let next = null;
+  for (const def of triggers) {
+    if (!def.nextChange) continue;
+    const at = def.nextChange(now, (config.triggers && config.triggers[def.name]) || {});
+    if (at && at.isValid() && (!next || at.isBefore(next))) next = at;
+  }
+  return next;
+}
 
 const createTriggerRegistry = (extra = []) => createRegistry("trigger", [...triggers, ...extra]);
 
@@ -110,4 +128,4 @@ function createPluginStore(host) {
   };
 }
 
-module.exports = { createTriggerRegistry, createTriggerHandler, createLocalStorageStore, createMemoryStore, createPluginStore };
+module.exports = { createTriggerRegistry, createTriggerHandler, createLocalStorageStore, createMemoryStore, createPluginStore, nextPeriodStart };

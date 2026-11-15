@@ -16,9 +16,9 @@ const { createLogger, compactBlankLines, formatDate, moment } = require("./utils
 
 // ── config (override per run with options.config) ────────────────────────────
 const DEFAULTS = {
-  configBlock: "clockworks-tasks", // language of the ```clockworks-tasks code block that marks a TaskFile
+  configBlock: "clockwork-tasks", // language of the ```clockwork-tasks code block that marks a TaskFile
   defaultTrigger: "daily",
-  defaultAnchor: "2026-03-27", // rotation start for [cyclic]; override per file with `anchor:` in the block
+  defaultAnchor: "2026-11-15", // rotation start for [cyclic]; override per file with `anchor:` in the block
   triggers: { daily: { at: "00:00" } }, // per-trigger options
   activeTag: "#active",
   doneHeading: "###### Done",
@@ -71,7 +71,7 @@ function createEngine({ io, store, config, clock, log, notify = () => {}, extens
   }
 
   async function run(options = {}) {
-    const report = { status: "idle", taskFiles: 0, fired: 0, created: 0, duplicates: 0, warnings: [], errors: [], notes: [] };
+    const report = { status: "idle", taskFiles: 0, fired: 0, created: 0, duplicates: 0, warnings: [], errors: [], notes: [], outputs: [] };
 
     // 1. identify + read
     const models = await loadTaskFiles(await discoverTaskFiles(io, config, options.paths), report);
@@ -105,6 +105,8 @@ function createEngine({ io, store, config, clock, log, notify = () => {}, extens
       );
       group.fired.push({ model, decision, generated });
     }
+
+    report.outputs = [...groups.keys()];
 
     // 4 + 5. write, sweep, commit
     for (const group of groups.values()) {

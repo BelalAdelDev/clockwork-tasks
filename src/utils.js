@@ -58,7 +58,7 @@ function parseDayList(text) {
   return { days, invalid };
 }
 
-// ── config block: a ```clockworks-tasks fenced code block of flat `key: value` lines ──
+// ── config block: a ```clockwork-tasks fenced code block of flat `key: value` lines ──
 // `end` = offset just after the closing fence; `body` = content with the block removed.
 const coerce = (raw) => {
   const v = raw.trim();
@@ -103,9 +103,11 @@ function createRegistry(label, defs = []) {
 // ── task lines (Tasks-plugin emoji format; change here to support other formats) ──
 const DUE = "\u{1F4C5}"; // 📅
 const DONE = "\u2705"; //  ✅
+const CANCEL = "\u274C"; // ❌
 const dateAfter = (marker) => new RegExp(`${marker}\\s*(\\d{4}-\\d{2}-\\d{2})`, "gu");
 const DUE_RE = dateAfter(DUE);
 const DONE_RE = dateAfter(DONE);
+const CANCEL_RE = dateAfter(CANCEL);
 const TASK_RE = /^(\s*)([-*])\s+\[(.)\]\s?(.*)$/;
 
 const lastDate = (text, re) => {
@@ -117,7 +119,7 @@ const lastDate = (text, re) => {
 function parseTask(line) {
   const m = line.match(TASK_RE);
   if (!m) return null;
-  return { indent: m[1], status: m[3], body: m[4], due: lastDate(m[4], DUE_RE), done: lastDate(m[4], DONE_RE) };
+  return { indent: m[1], status: m[3], body: m[4], due: lastDate(m[4], DUE_RE), done: lastDate(m[4], DONE_RE), cancelled: lastDate(m[4], CANCEL_RE) };
 }
 
 const formatTask = ({ text, due = "", tags = [], status = " " }) =>
@@ -130,6 +132,7 @@ function taskSignature(line, ignoreTags = []) {
   const tokens = task.body
     .replace(DUE_RE, " ")
     .replace(DONE_RE, " ")
+    .replace(CANCEL_RE, " ")
     .split(/\s+/)
     .filter((t) => t && !ignoreTags.includes(t));
   return `${task.due}|${tokens.join(" ")}`;

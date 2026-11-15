@@ -1,9 +1,10 @@
 {
   "id": "clockwork-tasks",
   "name": "Clockwork Tasks",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "minAppVersion": "1.4.0",
-  "description": "Task scheduler for recurring and cyclic tasks. Generates daily, weekday and rotating task lists into an output note.",
+  "description": "Schedule recurring and rotating tasks into a note, with automatic done and cancelled date stamps and a due-date menu.",
   "author": "BelalAdelDev",
+  "authorUrl": "https://github.com/BelalAdelDev",
   "isDesktopOnly": false
 }
